@@ -1,0 +1,1082 @@
+-- phpMyAdmin SQL Dump
+-- version 5.2.1
+-- https://www.phpmyadmin.net/
+--
+-- Host: 127.0.0.1
+-- Creato il: Mag 01, 2024 alle 03:15
+-- Versione del server: 10.4.32-MariaDB
+-- Versione PHP: 8.2.12
+
+SET SQL_MODE = "NO_AUTO_VALUE_ON_ZERO";
+START TRANSACTION;
+SET time_zone = "+00:00";
+
+
+/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;
+/*!40101 SET @OLD_CHARACTER_SET_RESULTS=@@CHARACTER_SET_RESULTS */;
+/*!40101 SET @OLD_COLLATION_CONNECTION=@@COLLATION_CONNECTION */;
+/*!40101 SET NAMES utf8mb4 */;
+
+--
+-- Database: `racinghub`
+--
+CREATE DATABASE IF NOT EXISTS `racinghub` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+USE `racinghub`;
+
+DELIMITER $$
+--
+-- Procedure
+--
+DROP PROCEDURE IF EXISTS `aggiorna_classifica_generale`$$
+CREATE DEFINER=`root`@`localhost` PROCEDURE `aggiorna_classifica_generale` (IN `I_ID_ISCRIZIONE_EVENTO` INT(11), IN `I_ID_SESSIONE` INT(11))   BEGIN
+    
+    DECLARE V_id_campionato INT(11) DEFAULT 0;
+    
+    --  Recupero ID_CAMPIONATO di cui fa parte IO_ID_SESSIONE
+    SELECT e.ID_CAMPIONATO INTO V_id_campionato
+		FROM t_evento e 
+		INNER JOIN t_sessione s ON e.ID_EVENTO = s.ID_EVENTO 
+        WHERE s.ID_SESSIONE = I_ID_SESSIONE;
+    
+    CALL assegna_punti_classifica(I_ID_ISCRIZIONE_EVENTO, V_id_campionato);
+    
+    CALL assegna_posizione_classifica(V_id_campionato);
+    
+END$$
+
+DROP PROCEDURE IF EXISTS `assegna_posizione_classifica`$$
+CREATE DEFINER=`root`@`localhost` PROCEDURE `assegna_posizione_classifica` (IN `I_ID_CAMPIONATO` INT(11))   BEGIN
+
+	DECLARE V_valore VARCHAR(45);
+
+	-- Recupero criterio per ordinare la classifica in caso di parita punti
+	SELECT R.VALORE into V_valore
+	FROM t_regola R, t_regolamento REG, t_campionato C
+	WHERE R.ID_REGOLA = REG.ID_REGOLA 
+		AND REG.ID_REGOLAMENTO = C.ID_REGOLAMENTO
+		AND C.ID_CAMPIONATO = I_ID_CAMPIONATO
+		AND R.GRUPPO_REGOLA= 'CRITERIO-ORDINE-CLASSIFICA'
+		AND R.ID_TIPO_SESSIONE= 'RANKING'
+        AND R.DOMINIO= 'RANK'
+		AND R.CHIAVE= 'RANK';
+	
+	-- Resetto le posizioni prima di aggiornare
+	UPDATE t_classifica
+    SET POSIZIONE = NULL
+    WHERE ID_CAMPIONATO = I_ID_CAMPIONATO;
+    
+	UPDATE t_classifica tc_upd
+	JOIN (
+		SELECT tc.ID_CAMPIONATO,
+			tc.ID_PILOTA,
+			(CASE WHEN V_valore = 'PTI-1P-2P-3P-AVG.P' THEN 
+					RANK() OVER(ORDER BY tc.PUNTI DESC,ris.num_primo_posto DESC, ris.num_secondo_posto DESC, ris.num_terzo_posto DESC, ris.media_posizioni ASC)
+				ELSE 
+					RANK() OVER(ORDER BY tc.PUNTI DESC)
+				END) AS ordine_classifica
+		FROM t_classifica tc
+			LEFT JOIN (
+				SELECT 
+                	COUNT(CASE WHEN tr.POSIZIONE NOT IN ('DNS', 'DNF', 'DSQ') AND tr.POSIZIONE = 1 THEN 1 END) AS num_primo_posto,
+					COUNT(CASE WHEN tr.POSIZIONE NOT IN ('DNS', 'DNF', 'DSQ') AND tr.POSIZIONE = 2 THEN 1 END) AS num_secondo_posto,
+					COUNT(CASE WHEN tr.POSIZIONE NOT IN ('DNS', 'DNF', 'DSQ') AND tr.POSIZIONE = 3 THEN 1 END) AS num_terzo_posto,
+					AVG(CASE WHEN tr.POSIZIONE NOT IN ('DNS', 'DNF', 'DSQ') THEN tr.POSIZIONE END) AS media_posizioni,
+					tie.ID_PILOTA,
+					te.ID_CAMPIONATO
+				FROM t_risultato tr
+					JOIN t_sessione ts ON tr.ID_SESSIONE = ts.ID_SESSIONE AND ts.ID_TIPO_SESSIONE='GR1'
+					JOIN t_evento te ON ts.ID_EVENTO = te.ID_EVENTO
+					JOIN t_iscrizione_evento tie ON tie.ID_ISCRIZIONE_EVENTO = tr.ID_ISCRIZIONE_EVENTO
+				WHERE te.ID_CAMPIONATO = I_ID_CAMPIONATO
+				GROUP BY tie.ID_PILOTA
+			) AS ris ON tc.ID_PILOTA = ris.ID_PILOTA 
+					AND tc.ID_CAMPIONATO = ris.ID_CAMPIONATO
+	) AS tnewpos ON tc_upd.ID_PILOTA = tnewpos.ID_PILOTA AND tc_upd.ID_CAMPIONATO = tnewpos.ID_CAMPIONATO
+	SET tc_upd.POSIZIONE = tnewpos.ordine_classifica;
+
+END$$
+
+DROP PROCEDURE IF EXISTS `assegna_punti_classifica`$$
+CREATE DEFINER=`root`@`localhost` PROCEDURE `assegna_punti_classifica` (IN `I_ID_ISCRIZIONE_EVENTO` INT(11), IN `I_ID_CAMPIONATO` INT(11))   BEGIN
+
+	DECLARE V_punti_classifica DECIMAL(6,2) DEFAULT 0;
+    DECLARE V_id_pilota INT(11);
+    DECLARE V_id_team INT(11);
+
+	-- Recupero idPilota e idTeam
+    SELECT ID_PILOTA, ID_TEAM INTO V_id_pilota, V_id_team
+    FROM t_iscrizione_evento
+    WHERE ID_ISCRIZIONE_EVENTO = I_ID_ISCRIZIONE_EVENTO;
+
+    -- Calcolo la somma dei punti di tutti gli eventi del campionato
+    SELECT SUM(r.PUNTI) INTO V_punti_classifica
+	FROM t_risultato r
+	INNER JOIN t_sessione s ON r.ID_SESSIONE = s.ID_SESSIONE
+	INNER JOIN t_evento e ON s.ID_EVENTO = e.ID_EVENTO
+	INNER JOIN t_campionato c ON e.ID_CAMPIONATO = c.ID_CAMPIONATO
+    INNER JOIN t_iscrizione_evento ie ON r.ID_ISCRIZIONE_EVENTO = ie.ID_ISCRIZIONE_EVENTO
+	WHERE ie.ID_PILOTA = V_id_pilota
+	AND c.ID_CAMPIONATO = I_ID_CAMPIONATO;
+
+	-- Insert o Update dei punti in t_classifica
+	IF EXISTS (SELECT 1 
+				FROM t_classifica 
+                WHERE ID_CAMPIONATO = I_ID_CAMPIONATO
+                AND ID_PILOTA = V_id_pilota
+                AND ID_TEAM = V_id_team) THEN
+		UPDATE t_classifica SET PUNTI = V_punti_classifica 
+			WHERE ID_CAMPIONATO = I_ID_CAMPIONATO
+                AND ID_PILOTA = V_id_pilota
+                AND ID_TEAM = V_id_team ;
+	ELSE
+		INSERT INTO t_classifica (ID_CAMPIONATO, ID_PILOTA, ID_TEAM, PUNTI) 
+			VALUES (I_ID_CAMPIONATO, V_id_pilota, V_id_team, V_punti_classifica);
+    END IF;
+
+END$$
+
+DROP PROCEDURE IF EXISTS `assegna_punti_risultato`$$
+CREATE DEFINER=`root`@`localhost` PROCEDURE `assegna_punti_risultato` (INOUT `IO_PUNTI` DECIMAL(6,2), IN `I_POSIZIONE` VARCHAR(45), IN `I_ID_SESSIONE` INT(11))   BEGIN
+    
+	DECLARE V_punti DECIMAL(6,2) DEFAULT 0;
+    
+    DECLARE fattore DECIMAL(3,2) DEFAULT 1;
+  
+    -- Recupera punti da assegnare (se presenti) per le posizioni DNS/DNF
+	IF(I_POSIZIONE='DNS' OR I_POSIZIONE='DNF' OR I_POSIZIONE='DSQ') THEN
+		SELECT CAST(R.VALORE AS DECIMAL(6,2)) INTO V_punti
+		FROM t_regola R, t_regolamento REG, t_sessione S, t_evento E, t_campionato C
+		WHERE R.ID_REGOLA = REG.ID_REGOLA 
+			AND REG.ID_REGOLAMENTO = C.ID_REGOLAMENTO
+			AND R.ID_TIPO_SESSIONE = S.ID_TIPO_SESSIONE
+			AND S.ID_EVENTO = E.ID_EVENTO
+			AND E.ID_CAMPIONATO = C.ID_CAMPIONATO
+			AND S.ID_SESSIONE = I_ID_SESSIONE
+			AND R.GRUPPO_REGOLA= 'ASSEGNAZIONE-PUNTI'
+            AND R.DOMINIO= 'PTI-OTHER-POSITION'
+            AND R.CHIAVE= 'NO-CLASSIFICATO';
+     -- Recupera punti da assegnare (se presenti) per le altre posizioni non definiti
+	ELSEIF(CAST(I_POSIZIONE AS UNSIGNED) > 0) THEN
+		SELECT CAST(R.VALORE AS DECIMAL(6,2)) INTO V_punti
+		FROM t_regola R, t_regolamento REG, t_sessione S, t_evento E, t_campionato C
+		WHERE R.ID_REGOLA = REG.ID_REGOLA 
+			AND REG.ID_REGOLAMENTO = C.ID_REGOLAMENTO
+			AND R.ID_TIPO_SESSIONE = S.ID_TIPO_SESSIONE
+			AND S.ID_EVENTO = E.ID_EVENTO
+			AND E.ID_CAMPIONATO = C.ID_CAMPIONATO
+			AND S.ID_SESSIONE = I_ID_SESSIONE
+			AND R.GRUPPO_REGOLA= 'ASSEGNAZIONE-PUNTI'
+            AND R.DOMINIO= 'PTI-OTHER-POSITION'
+            AND R.CHIAVE= 'SI-CLASSIFICATO';
+	END IF;
+	
+	-- Recupera punti da assegnare se le posizioni sono censite
+	SELECT CAST(R.VALORE AS DECIMAL(6,2)) INTO V_punti
+	FROM t_regola R, t_regolamento REG, t_sessione S, t_evento E, t_campionato C
+	WHERE R.ID_REGOLA = REG.ID_REGOLA 
+		AND REG.ID_REGOLAMENTO = C.ID_REGOLAMENTO
+		AND R.ID_TIPO_SESSIONE = S.ID_TIPO_SESSIONE
+		AND S.ID_EVENTO = E.ID_EVENTO
+		AND E.ID_CAMPIONATO = C.ID_CAMPIONATO
+		AND S.ID_SESSIONE = I_ID_SESSIONE
+		AND R.GRUPPO_REGOLA= 'ASSEGNAZIONE-PUNTI'
+		AND R.DOMINIO= 'PTI-POSITION'
+		AND R.CHIAVE= I_POSIZIONE;
+    
+
+    CALL fattore_puntidurata(I_ID_SESSIONE, fattore);
+    
+    -- Setto campo PUNTI con i valori calcolati
+    SET IO_PUNTI = V_punti * fattore;
+
+END$$
+
+DROP PROCEDURE IF EXISTS `fattore_puntidurata`$$
+CREATE DEFINER=`root`@`localhost` PROCEDURE `fattore_puntidurata` (IN `I_ID_SESSIONE` INT(11), OUT `O_FATTORE` DECIMAL(3,2))   BEGIN
+
+	DECLARE V_percent_durata DECIMAL(5,2) DEFAULT 100;
+
+	SET O_FATTORE = 1;
+    
+    SELECT (CASE WHEN PERCENT_DURATA IS NULL THEN 100 ELSE PERCENT_DURATA END) AS PERCENT_DURATA INTO V_percent_durata
+    FROM t_sessione
+    WHERE ID_SESSIONE = I_ID_SESSIONE;
+    
+    SELECT CAST(R.VALORE AS DECIMAL(3,2)) INTO O_FATTORE
+    FROM t_regola R, t_regolamento REG, t_sessione S, t_evento E, t_campionato C
+    WHERE R.ID_REGOLA = REG.ID_REGOLA 
+		AND REG.ID_REGOLAMENTO = C.ID_REGOLAMENTO
+		AND R.ID_TIPO_SESSIONE = S.ID_TIPO_SESSIONE
+		AND S.ID_EVENTO = E.ID_EVENTO
+		AND E.ID_CAMPIONATO = C.ID_CAMPIONATO
+		AND S.ID_SESSIONE = I_ID_SESSIONE
+		AND R.GRUPPO_REGOLA= 'ASSEGNAZIONE-PUNTI'
+        AND R.DOMINIO='DURATION-SESSION'
+        AND CAST(R.CHIAVE AS DECIMAL(5,2)) >= V_percent_durata
+    ORDER BY CAST(R.CHIAVE AS DECIMAL(5,2)) ASC
+	LIMIT 1;
+
+END$$
+
+DROP PROCEDURE IF EXISTS `set_puntibonus_risultato`$$
+CREATE DEFINER=`root`@`localhost` PROCEDURE `set_puntibonus_risultato` (IN `I_ID_SESSIONE` INT(11))   BEGIN
+    
+	DECLARE V_id_iscrizione_evento INT(11);
+	DECLARE V_punti DECIMAL(6,2) DEFAULT 0;
+    DECLARE V_chiave VARCHAR(45);
+    DECLARE V_valore VARCHAR(45);
+    
+    DECLARE fattore DECIMAL(3,2);
+  
+	DECLARE done INT DEFAULT FALSE;
+	DECLARE cur1 CURSOR FOR  
+		SELECT R.CHIAVE, R.VALORE
+		FROM t_regola R, t_regolamento REG, t_sessione S, t_evento E, t_campionato C
+		WHERE R.ID_REGOLA = REG.ID_REGOLA 
+			AND REG.ID_REGOLAMENTO = C.ID_REGOLAMENTO
+			AND R.ID_TIPO_SESSIONE = S.ID_TIPO_SESSIONE
+			AND S.ID_EVENTO = E.ID_EVENTO
+			AND E.ID_CAMPIONATO = C.ID_CAMPIONATO
+			AND S.ID_SESSIONE = I_ID_SESSIONE
+			AND R.GRUPPO_REGOLA= 'ASSEGNAZIONE-PUNTI'
+            AND R.DOMINIO= 'PTI-BONUS';
+	DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = TRUE;
+	
+	
+	-- Recupera punti da assegnare se le posizioni sono censite
+	OPEN cur1;
+		read_loop: LOOP
+			FETCH cur1 INTO V_chiave, V_valore;
+			IF done THEN
+				LEAVE read_loop;
+			END IF;
+            
+            IF(V_chiave='GIRO-VELOCE') THEN
+				
+				SELECT ID_ISCRIZIONE_EVENTO, PUNTI INTO V_id_iscrizione_evento, V_punti
+				FROM t_risultato
+				WHERE ID_SESSIONE= I_ID_SESSIONE
+				ORDER BY BEST_LAP ASC
+				LIMIT 1;
+				
+			    CALL fattore_puntidurata(I_ID_SESSIONE, fattore);
+
+				-- Moltiplico per il fattore solo i punti da aggiungere
+				SET V_punti = V_punti + (CAST(V_valore AS DECIMAL(6,2)) * fattore);
+				
+				UPDATE t_risultato
+				SET PUNTI = V_punti
+				WHERE ID_SESSIONE = I_ID_SESSIONE
+				AND ID_ISCRIZIONE_EVENTO = V_id_iscrizione_evento;
+				
+			END IF;
+		END LOOP;
+	CLOSE cur1;
+
+END$$
+
+DELIMITER ;
+
+-- --------------------------------------------------------
+
+--
+-- Struttura della tabella `hibernate_sequence`
+--
+
+DROP TABLE IF EXISTS `hibernate_sequence`;
+CREATE TABLE `hibernate_sequence` (
+  `next_not_cached_value` bigint(21) NOT NULL,
+  `minimum_value` bigint(21) NOT NULL,
+  `maximum_value` bigint(21) NOT NULL,
+  `start_value` bigint(21) NOT NULL COMMENT 'start value when sequences is created or value if RESTART is used',
+  `increment` bigint(21) NOT NULL COMMENT 'increment value',
+  `cache_size` bigint(21) UNSIGNED NOT NULL,
+  `cycle_option` tinyint(1) UNSIGNED NOT NULL COMMENT '0 if no cycles are allowed, 1 if the sequence should begin a new cycle when maximum_value is passed',
+  `cycle_count` bigint(21) NOT NULL COMMENT 'How many cycles have been done'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+--
+-- Dump dei dati per la tabella `hibernate_sequence`
+--
+
+INSERT INTO `hibernate_sequence` (`next_not_cached_value`, `minimum_value`, `maximum_value`, `start_value`, `increment`, `cache_size`, `cycle_option`, `cycle_count`) VALUES(1, 1, 9223372036854775806, 1, 1, 1000, 0, 0);
+
+-- --------------------------------------------------------
+
+--
+-- Struttura della tabella `t_campionato`
+--
+
+DROP TABLE IF EXISTS `t_campionato`;
+CREATE TABLE `t_campionato` (
+  `ID_CAMPIONATO` int(11) NOT NULL,
+  `NOME` varchar(90) DEFAULT NULL,
+  `DATA_INIZIO` date DEFAULT NULL,
+  `DATA_FINE` date DEFAULT NULL,
+  `ID_REGOLAMENTO` int(11) DEFAULT NULL,
+  `ID_UTENTE` int(11) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+--
+-- Dump dei dati per la tabella `t_campionato`
+--
+
+INSERT INTO `t_campionato` (`ID_CAMPIONATO`, `NOME`, `DATA_INIZIO`, `DATA_FINE`, `ID_REGOLAMENTO`, `ID_UTENTE`) VALUES(1, '(PRO) 5^ Campionato Endurance Ci Vediamo In Pista', '2024-02-29', NULL, 1, 1);
+INSERT INTO `t_campionato` (`ID_CAMPIONATO`, `NOME`, `DATA_INIZIO`, `DATA_FINE`, `ID_REGOLAMENTO`, `ID_UTENTE`) VALUES(2, '(AMA) 5^ Campionato Endurance Ci Vediamo In Pista', '2024-02-29', NULL, 1, 1);
+
+-- --------------------------------------------------------
+
+--
+-- Struttura della tabella `t_classifica`
+--
+
+DROP TABLE IF EXISTS `t_classifica`;
+CREATE TABLE `t_classifica` (
+  `ID_CLASSIFICA` int(11) NOT NULL,
+  `ID_CAMPIONATO` int(11) DEFAULT NULL,
+  `POSIZIONE` int(11) DEFAULT NULL,
+  `ID_PILOTA` int(11) DEFAULT NULL,
+  `ID_TEAM` int(11) DEFAULT NULL,
+  `PUNTI` decimal(6,2) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+--
+-- Dump dei dati per la tabella `t_classifica`
+--
+
+INSERT INTO `t_classifica` (`ID_CLASSIFICA`, `ID_CAMPIONATO`, `POSIZIONE`, `ID_PILOTA`, `ID_TEAM`, `PUNTI`) VALUES(46, 1, 9, 10, 6, 6.00);
+INSERT INTO `t_classifica` (`ID_CLASSIFICA`, `ID_CAMPIONATO`, `POSIZIONE`, `ID_PILOTA`, `ID_TEAM`, `PUNTI`) VALUES(47, 1, 5, 5, 3, 9.00);
+INSERT INTO `t_classifica` (`ID_CLASSIFICA`, `ID_CAMPIONATO`, `POSIZIONE`, `ID_PILOTA`, `ID_TEAM`, `PUNTI`) VALUES(48, 1, 7, 7, 5, 6.00);
+INSERT INTO `t_classifica` (`ID_CLASSIFICA`, `ID_CAMPIONATO`, `POSIZIONE`, `ID_PILOTA`, `ID_TEAM`, `PUNTI`) VALUES(49, 1, 1, 12, 11, 17.00);
+INSERT INTO `t_classifica` (`ID_CLASSIFICA`, `ID_CAMPIONATO`, `POSIZIONE`, `ID_PILOTA`, `ID_TEAM`, `PUNTI`) VALUES(50, 1, 3, 6, 3, 12.00);
+INSERT INTO `t_classifica` (`ID_CLASSIFICA`, `ID_CAMPIONATO`, `POSIZIONE`, `ID_PILOTA`, `ID_TEAM`, `PUNTI`) VALUES(51, 1, 7, 1, 1, 6.00);
+INSERT INTO `t_classifica` (`ID_CLASSIFICA`, `ID_CAMPIONATO`, `POSIZIONE`, `ID_PILOTA`, `ID_TEAM`, `PUNTI`) VALUES(52, 1, 10, 8, 14, 3.00);
+INSERT INTO `t_classifica` (`ID_CLASSIFICA`, `ID_CAMPIONATO`, `POSIZIONE`, `ID_PILOTA`, `ID_TEAM`, `PUNTI`) VALUES(53, 1, 2, 9, 5, 15.00);
+INSERT INTO `t_classifica` (`ID_CLASSIFICA`, `ID_CAMPIONATO`, `POSIZIONE`, `ID_PILOTA`, `ID_TEAM`, `PUNTI`) VALUES(54, 1, 3, 14, 6, 12.00);
+INSERT INTO `t_classifica` (`ID_CLASSIFICA`, `ID_CAMPIONATO`, `POSIZIONE`, `ID_PILOTA`, `ID_TEAM`, `PUNTI`) VALUES(55, 1, 14, 11, 10, 3.00);
+INSERT INTO `t_classifica` (`ID_CLASSIFICA`, `ID_CAMPIONATO`, `POSIZIONE`, `ID_PILOTA`, `ID_TEAM`, `PUNTI`) VALUES(56, 1, 12, 13, 10, 3.00);
+INSERT INTO `t_classifica` (`ID_CLASSIFICA`, `ID_CAMPIONATO`, `POSIZIONE`, `ID_PILOTA`, `ID_TEAM`, `PUNTI`) VALUES(61, 1, 6, 29, 15, 6.00);
+INSERT INTO `t_classifica` (`ID_CLASSIFICA`, `ID_CAMPIONATO`, `POSIZIONE`, `ID_PILOTA`, `ID_TEAM`, `PUNTI`) VALUES(62, 1, 11, 4, 1, 3.00);
+INSERT INTO `t_classifica` (`ID_CLASSIFICA`, `ID_CAMPIONATO`, `POSIZIONE`, `ID_PILOTA`, `ID_TEAM`, `PUNTI`) VALUES(63, 1, 12, 30, 15, 3.00);
+
+-- --------------------------------------------------------
+
+--
+-- Struttura della tabella `t_evento`
+--
+
+DROP TABLE IF EXISTS `t_evento`;
+CREATE TABLE `t_evento` (
+  `ID_EVENTO` int(11) NOT NULL,
+  `NOME` varchar(45) DEFAULT NULL,
+  `DATA_INIZIO` timestamp NULL DEFAULT NULL,
+  `QUOTA_ISCRIZIONE` decimal(6,2) DEFAULT NULL,
+  `SCADENZA_ISCRIZIONE` timestamp NULL DEFAULT NULL,
+  `ID_PISTA` int(11) DEFAULT NULL,
+  `ID_CAMPIONATO` int(11) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+--
+-- Dump dei dati per la tabella `t_evento`
+--
+
+INSERT INTO `t_evento` (`ID_EVENTO`, `NOME`, `DATA_INIZIO`, `QUOTA_ISCRIZIONE`, `SCADENZA_ISCRIZIONE`, `ID_PISTA`, `ID_CAMPIONATO`) VALUES(1, 'Eve.1 - Casaluce GP', '2024-02-29 19:00:00', 75.00, '2024-02-17 23:00:00', 1, 1);
+INSERT INTO `t_evento` (`ID_EVENTO`, `NOME`, `DATA_INIZIO`, `QUOTA_ISCRIZIONE`, `SCADENZA_ISCRIZIONE`, `ID_PISTA`, `ID_CAMPIONATO`) VALUES(2, 'Eve.2 - CastelVolturno GP', '2024-03-20 19:30:00', 75.00, '2024-03-14 23:00:00', 3, 1);
+INSERT INTO `t_evento` (`ID_EVENTO`, `NOME`, `DATA_INIZIO`, `QUOTA_ISCRIZIONE`, `SCADENZA_ISCRIZIONE`, `ID_PISTA`, `ID_CAMPIONATO`) VALUES(3, 'Eve.3 - Montesarchio GP', '2024-04-21 08:30:00', 75.00, '2024-04-13 22:00:00', 2, 1);
+
+-- --------------------------------------------------------
+
+--
+-- Struttura della tabella `t_iscrizione_evento`
+--
+
+DROP TABLE IF EXISTS `t_iscrizione_evento`;
+CREATE TABLE `t_iscrizione_evento` (
+  `ID_ISCRIZIONE_EVENTO` int(11) NOT NULL,
+  `TARGA_VEICOLO` varchar(10) DEFAULT NULL,
+  `ID_PILOTA` int(11) DEFAULT NULL,
+  `ID_TEAM` int(11) DEFAULT NULL,
+  `ID_EVENTO` int(11) DEFAULT NULL,
+  `DATA_PAGAMENTO` timestamp NULL DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+--
+-- Dump dei dati per la tabella `t_iscrizione_evento`
+--
+
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(1, '9', 1, 1, 1, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(3, '7', 5, 3, 1, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(4, '1', 6, 3, 1, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(5, '2', 7, 5, 1, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(6, '3', 8, 14, 1, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(7, '4', 9, 5, 1, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(8, '5', 10, 6, 1, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(9, '6', 11, 10, 1, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(10, '8', 12, 11, 1, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(11, '10', 13, 10, 1, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(12, '11', 14, 6, 1, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(46, '7', 12, 11, 2, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(48, '1', 6, 3, 2, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(49, '8', 29, 15, 2, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(50, '3', 9, 5, 2, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(51, '11', 14, 6, 2, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(52, '2', 7, 5, 2, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(53, '6', 5, 3, 2, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(54, '9', 1, 1, 2, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(55, '4', 4, 1, 2, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(56, '10', 30, 15, 2, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(57, '5', 10, 6, 2, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(58, '5', 5, 3, 3, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(59, '6', 12, 11, 3, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(60, '2', 9, 5, 3, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(61, '9', 14, 6, 3, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(62, '8', 13, 10, 3, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(64, '1', 7, 5, 3, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(65, '18', 10, 6, 3, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(66, '7', 1, 1, 3, NULL);
+INSERT INTO `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`, `TARGA_VEICOLO`, `ID_PILOTA`, `ID_TEAM`, `ID_EVENTO`, `DATA_PAGAMENTO`) VALUES(67, '3', 4, 1, 3, NULL);
+
+-- --------------------------------------------------------
+
+--
+-- Struttura della tabella `t_pilota`
+--
+
+DROP TABLE IF EXISTS `t_pilota`;
+CREATE TABLE `t_pilota` (
+  `ID_PILOTA` int(11) NOT NULL,
+  `COGNOME` varchar(45) DEFAULT NULL,
+  `NOME` varchar(45) DEFAULT NULL,
+  `DATA_NASCITA` date DEFAULT NULL,
+  `PESO_KG` decimal(5,2) DEFAULT NULL,
+  `CELLULARE` varchar(15) DEFAULT NULL,
+  `ID_TEAM` int(11) DEFAULT NULL,
+  `ID_UTENTE` int(11) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+--
+-- Dump dei dati per la tabella `t_pilota`
+--
+
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(1, 'Fusco', 'Rocco', '1997-09-22', 80.00, '3402800203', 1, 1);
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(4, 'Barra', 'Biagio', '1995-10-21', 98.00, '3933258013', 1, 2);
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(5, 'Coppola', 'Marco', '1980-01-01', 79.00, '3476782260', 3, NULL);
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(6, 'Adaggio', 'Raffaele', NULL, 75.00, NULL, 3, NULL);
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(7, 'Albano', NULL, NULL, 80.00, NULL, 5, NULL);
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(8, 'Alborelli', NULL, NULL, 75.00, NULL, 14, NULL);
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(9, 'Aquilante', NULL, NULL, 79.00, NULL, 5, NULL);
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(10, 'Borrozzino', NULL, NULL, 90.00, NULL, 6, NULL);
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(11, 'Cerbone', NULL, NULL, 93.00, NULL, 10, NULL);
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(12, 'Cotumaccio', NULL, NULL, 80.00, NULL, 11, NULL);
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(13, 'Setaro', NULL, NULL, 78.00, NULL, 10, NULL);
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(14, 'Vollero', NULL, NULL, 75.00, NULL, 6, NULL);
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(15, 'Arnone', NULL, NULL, 80.00, NULL, 9, NULL);
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(16, 'Articolare', NULL, NULL, 69.00, NULL, 7, NULL);
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(17, 'Cacciapuoti', NULL, NULL, 78.50, NULL, 13, NULL);
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(18, 'Galdiero', NULL, NULL, 80.00, NULL, 4, NULL);
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(19, 'Guida', NULL, NULL, 83.00, NULL, 12, NULL);
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(20, 'Marciello', NULL, NULL, 86.00, NULL, 12, NULL);
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(21, 'Pugliese', NULL, NULL, 80.00, NULL, 4, NULL);
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(22, 'Russo', 'Josh', NULL, 80.00, NULL, 13, NULL);
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(23, 'Russo', 'Samuele', NULL, 75.00, NULL, 9, NULL);
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(24, 'Salzano', NULL, NULL, 55.00, NULL, 7, NULL);
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(25, 'Sponzilli', NULL, NULL, 78.00, NULL, 8, NULL);
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(29, 'Esposito', NULL, NULL, 78.00, NULL, 15, NULL);
+INSERT INTO `t_pilota` (`ID_PILOTA`, `COGNOME`, `NOME`, `DATA_NASCITA`, `PESO_KG`, `CELLULARE`, `ID_TEAM`, `ID_UTENTE`) VALUES(30, 'Palladino', NULL, NULL, 78.00, NULL, 15, NULL);
+
+-- --------------------------------------------------------
+
+--
+-- Struttura della tabella `t_pista`
+--
+
+DROP TABLE IF EXISTS `t_pista`;
+CREATE TABLE `t_pista` (
+  `ID_PISTA` int(11) NOT NULL,
+  `NOME` varchar(45) DEFAULT NULL,
+  `INDIRIZZO` varchar(100) DEFAULT NULL,
+  `CITTA` varchar(45) DEFAULT NULL,
+  `PROVINCIA` varchar(2) DEFAULT NULL,
+  `CAP` varchar(5) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+--
+-- Dump dei dati per la tabella `t_pista`
+--
+
+INSERT INTO `t_pista` (`ID_PISTA`, `NOME`, `INDIRIZZO`, `CITTA`, `PROVINCIA`, `CAP`) VALUES(1, 'Kartrodomo Casaluce', 'Via Vecchio Camposanto', 'Casaluce', 'CE', '81030');
+INSERT INTO `t_pista` (`ID_PISTA`, `NOME`, `INDIRIZZO`, `CITTA`, `PROVINCIA`, `CAP`) VALUES(2, 'Pista Caudina Montesarchio', 'Via Giustino Fortunato, 1', 'Montesarchio', 'BN', '82016');
+INSERT INTO `t_pista` (`ID_PISTA`, `NOME`, `INDIRIZZO`, `CITTA`, `PROVINCIA`, `CAP`) VALUES(3, 'Pista Kart Italia', 'Via Occidentale SP261', 'Castel Volturno', 'CE', '81030');
+INSERT INTO `t_pista` (`ID_PISTA`, `NOME`, `INDIRIZZO`, `CITTA`, `PROVINCIA`, `CAP`) VALUES(4, 'Kartrodomo Iscaro', 'Via Ferrovia, 12', 'Chianche', 'AV', '83010');
+
+-- --------------------------------------------------------
+
+--
+-- Struttura della tabella `t_regola`
+--
+
+DROP TABLE IF EXISTS `t_regola`;
+CREATE TABLE `t_regola` (
+  `ID_REGOLA` int(11) NOT NULL,
+  `GRUPPO_REGOLA` enum('ASSEGNAZIONE-PUNTI','CRITERIO-ORDINE-CLASSIFICA','','') NOT NULL,
+  `ID_TIPO_SESSIONE` varchar(10) DEFAULT NULL,
+  `DOMINIO` varchar(45) DEFAULT NULL,
+  `CHIAVE` varchar(45) DEFAULT NULL,
+  `VALORE` varchar(45) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+--
+-- Dump dei dati per la tabella `t_regola`
+--
+
+INSERT INTO `t_regola` (`ID_REGOLA`, `GRUPPO_REGOLA`, `ID_TIPO_SESSIONE`, `DOMINIO`, `CHIAVE`, `VALORE`) VALUES(8, 'ASSEGNAZIONE-PUNTI', 'GR1', 'PTI-POSITION', '1', '10');
+INSERT INTO `t_regola` (`ID_REGOLA`, `GRUPPO_REGOLA`, `ID_TIPO_SESSIONE`, `DOMINIO`, `CHIAVE`, `VALORE`) VALUES(9, 'ASSEGNAZIONE-PUNTI', 'GR1', 'PTI-POSITION', '2', '8');
+INSERT INTO `t_regola` (`ID_REGOLA`, `GRUPPO_REGOLA`, `ID_TIPO_SESSIONE`, `DOMINIO`, `CHIAVE`, `VALORE`) VALUES(10, 'ASSEGNAZIONE-PUNTI', 'GR1', 'PTI-POSITION', '3', '6');
+INSERT INTO `t_regola` (`ID_REGOLA`, `GRUPPO_REGOLA`, `ID_TIPO_SESSIONE`, `DOMINIO`, `CHIAVE`, `VALORE`) VALUES(11, 'ASSEGNAZIONE-PUNTI', 'GR1', 'PTI-POSITION', '4', '5');
+INSERT INTO `t_regola` (`ID_REGOLA`, `GRUPPO_REGOLA`, `ID_TIPO_SESSIONE`, `DOMINIO`, `CHIAVE`, `VALORE`) VALUES(12, 'ASSEGNAZIONE-PUNTI', 'GR1', 'PTI-POSITION', '5', '4');
+INSERT INTO `t_regola` (`ID_REGOLA`, `GRUPPO_REGOLA`, `ID_TIPO_SESSIONE`, `DOMINIO`, `CHIAVE`, `VALORE`) VALUES(13, 'ASSEGNAZIONE-PUNTI', 'GR1', 'PTI-OTHER-POSITION', 'SI-CLASSIFICATO', '3');
+INSERT INTO `t_regola` (`ID_REGOLA`, `GRUPPO_REGOLA`, `ID_TIPO_SESSIONE`, `DOMINIO`, `CHIAVE`, `VALORE`) VALUES(14, 'ASSEGNAZIONE-PUNTI', 'GR1', 'PTI-OTHER-POSITION', 'NO-CLASSIFICATO', '0');
+INSERT INTO `t_regola` (`ID_REGOLA`, `GRUPPO_REGOLA`, `ID_TIPO_SESSIONE`, `DOMINIO`, `CHIAVE`, `VALORE`) VALUES(15, 'ASSEGNAZIONE-PUNTI', 'GR1', 'PTI-BONUS', 'GIRO-VELOCE', '1');
+INSERT INTO `t_regola` (`ID_REGOLA`, `GRUPPO_REGOLA`, `ID_TIPO_SESSIONE`, `DOMINIO`, `CHIAVE`, `VALORE`) VALUES(17, 'ASSEGNAZIONE-PUNTI', 'GR1', 'DURATION-SESSION', '75', '0.5');
+INSERT INTO `t_regola` (`ID_REGOLA`, `GRUPPO_REGOLA`, `ID_TIPO_SESSIONE`, `DOMINIO`, `CHIAVE`, `VALORE`) VALUES(22, 'ASSEGNAZIONE-PUNTI', 'GR1', 'DURATION-SESSION', '85', '0.75');
+INSERT INTO `t_regola` (`ID_REGOLA`, `GRUPPO_REGOLA`, `ID_TIPO_SESSIONE`, `DOMINIO`, `CHIAVE`, `VALORE`) VALUES(23, 'ASSEGNAZIONE-PUNTI', 'GR1', 'DURATION-SESSION', '40', '0.0');
+INSERT INTO `t_regola` (`ID_REGOLA`, `GRUPPO_REGOLA`, `ID_TIPO_SESSIONE`, `DOMINIO`, `CHIAVE`, `VALORE`) VALUES(24, 'CRITERIO-ORDINE-CLASSIFICA', 'RANKING', 'RANK', 'RANK', 'PTI-1P-2P-3P-AVG.P');
+
+-- --------------------------------------------------------
+
+--
+-- Struttura della tabella `t_regolamento`
+--
+
+DROP TABLE IF EXISTS `t_regolamento`;
+CREATE TABLE `t_regolamento` (
+  `ID_REGOLAMENTO` int(11) NOT NULL,
+  `ID_REGOLA` int(11) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+--
+-- Dump dei dati per la tabella `t_regolamento`
+--
+
+INSERT INTO `t_regolamento` (`ID_REGOLAMENTO`, `ID_REGOLA`) VALUES(1, 8);
+INSERT INTO `t_regolamento` (`ID_REGOLAMENTO`, `ID_REGOLA`) VALUES(1, 9);
+INSERT INTO `t_regolamento` (`ID_REGOLAMENTO`, `ID_REGOLA`) VALUES(1, 10);
+INSERT INTO `t_regolamento` (`ID_REGOLAMENTO`, `ID_REGOLA`) VALUES(1, 11);
+INSERT INTO `t_regolamento` (`ID_REGOLAMENTO`, `ID_REGOLA`) VALUES(1, 12);
+INSERT INTO `t_regolamento` (`ID_REGOLAMENTO`, `ID_REGOLA`) VALUES(1, 13);
+INSERT INTO `t_regolamento` (`ID_REGOLAMENTO`, `ID_REGOLA`) VALUES(1, 14);
+INSERT INTO `t_regolamento` (`ID_REGOLAMENTO`, `ID_REGOLA`) VALUES(1, 15);
+INSERT INTO `t_regolamento` (`ID_REGOLAMENTO`, `ID_REGOLA`) VALUES(1, 17);
+INSERT INTO `t_regolamento` (`ID_REGOLAMENTO`, `ID_REGOLA`) VALUES(1, 22);
+INSERT INTO `t_regolamento` (`ID_REGOLAMENTO`, `ID_REGOLA`) VALUES(1, 23);
+INSERT INTO `t_regolamento` (`ID_REGOLAMENTO`, `ID_REGOLA`) VALUES(1, 24);
+
+-- --------------------------------------------------------
+
+--
+-- Struttura della tabella `t_risultato`
+--
+
+DROP TABLE IF EXISTS `t_risultato`;
+CREATE TABLE `t_risultato` (
+  `ID_RISULTATO` int(11) NOT NULL,
+  `ID_SESSIONE` int(11) DEFAULT NULL,
+  `POSIZIONE` varchar(3) DEFAULT NULL,
+  `ID_ISCRIZIONE_EVENTO` int(11) DEFAULT NULL,
+  `N_LAP` int(11) DEFAULT NULL,
+  `GAP_TO_LEADER` time(3) DEFAULT NULL,
+  `GAP_TO_POSITION` time(3) DEFAULT NULL,
+  `BEST_LAP` time(3) DEFAULT NULL,
+  `TOTAL_TIME` time(3) DEFAULT NULL,
+  `PUNTI` decimal(6,2) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+--
+-- Dump dei dati per la tabella `t_risultato`
+--
+
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(1, 1, '4', 1, 3, NULL, NULL, '00:01:18.440', NULL, 0.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(2, 1, '2', 12, 3, NULL, NULL, '00:01:18.280', NULL, 0.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(3, 1, '3', 9, 3, NULL, NULL, '00:01:18.398', NULL, 0.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(15, 1, '1', 3, 3, NULL, NULL, '00:01:17.760', NULL, 0.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(16, 1, '5', 11, 3, NULL, NULL, '00:01:18.722', NULL, 0.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(17, 1, '6', 7, 3, NULL, NULL, '00:01:19.228', NULL, 0.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(18, 1, '7', 8, 3, NULL, NULL, '00:01:19.458', NULL, 0.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(19, 1, '8', 6, 3, NULL, NULL, '00:01:19.706', NULL, 0.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(20, 1, '9', 5, 3, NULL, NULL, '00:01:20.220', NULL, 0.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(21, 1, '10', 10, 3, NULL, NULL, '00:01:20.435', NULL, 0.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(22, 1, '11', 4, 3, NULL, NULL, '00:01:20.813', NULL, 0.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(23, 2, '1', 7, 21, '00:01:04.474', '00:00:00.000', '00:01:16.216', '00:28:37.018', 10.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(27, 2, '2', 12, 21, '00:00:04.170', '00:00:04.170', '00:01:16.411', '00:28:41.188', 8.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(28, 2, '3', 3, 21, '00:00:07.246', '00:00:03.076', '00:01:16.795', '00:28:44.264', 6.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(29, 2, '4', 10, 21, '00:00:27.122', '00:00:00.499', '00:01:15.797', '00:29:04.140', 6.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(30, 2, '5', 4, 21, '00:00:26.623', '00:00:19.377', '00:01:17.647', '00:29:03.641', 4.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(31, 2, '6', 8, 21, '00:00:30.913', '00:00:03.791', '00:01:17.788', '00:29:07.931', 3.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(32, 2, '7', 1, 21, '00:00:32.126', '00:00:01.213', '00:01:17.486', '00:29:09.144', 3.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(33, 2, '8', 6, 21, '00:00:58.843', '00:00:14.087', '00:01:18.055', '00:29:35.861', 3.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(34, 2, '9', 5, 21, '00:01:04.474', '00:00:03.710', '00:01:19.204', '00:29:41.492', 3.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(35, 2, '10', 11, 20, '00:00:44.756', '00:00:12.630', '00:01:17.500', '00:29:21.774', 3.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(36, 2, '11', 9, 20, '00:01:00.764', '00:00:01.921', '00:01:17.614', '00:29:37.782', 3.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(290, 4, '1', 46, 41, NULL, NULL, '00:00:44.642', '00:31:20.063', 11.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(291, 4, '2', 48, 41, NULL, NULL, '00:00:45.531', '00:31:31.118', 8.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(292, 4, '3', 49, 41, NULL, NULL, '00:00:45.535', '00:31:41.408', 6.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(293, 4, '4', 50, 41, NULL, NULL, '00:00:45.041', '00:31:55.846', 5.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(294, 4, '5', 51, 41, NULL, NULL, '00:00:45.629', '00:31:58.101', 4.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(295, 4, '6', 52, 41, NULL, NULL, '00:00:46.683', '00:32:02.629', 3.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(296, 4, '7', 53, 40, NULL, NULL, '00:00:46.168', '00:31:22.744', 3.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(297, 4, '8', 54, 40, NULL, NULL, '00:00:46.228', '00:31:39.898', 3.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(298, 4, '9', 55, 39, NULL, NULL, '00:00:47.186', '00:31:22.925', 3.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(299, 4, '10', 56, 39, NULL, NULL, '00:00:45.767', '00:31:23.720', 3.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(300, 4, '11', 57, 38, NULL, NULL, '00:00:45.465', '00:31:51.444', 3.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(301, 3, '1', 46, NULL, NULL, NULL, NULL, NULL, 0.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(302, 3, '2', 48, NULL, NULL, NULL, NULL, NULL, 0.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(303, 3, '3', 49, NULL, NULL, NULL, NULL, NULL, 0.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(304, 3, '4', 50, NULL, NULL, NULL, NULL, NULL, 0.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(305, 3, '5', 51, NULL, NULL, NULL, NULL, NULL, 0.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(306, 3, '6', 52, NULL, NULL, NULL, NULL, NULL, 0.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(307, 3, '7', 53, NULL, NULL, NULL, NULL, NULL, 0.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(308, 3, '8', 54, NULL, NULL, NULL, NULL, NULL, 0.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(309, 3, '9', 55, NULL, NULL, NULL, NULL, NULL, 0.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(310, 3, '10', 56, NULL, NULL, NULL, NULL, NULL, 0.00);
+INSERT INTO `t_risultato` (`ID_RISULTATO`, `ID_SESSIONE`, `POSIZIONE`, `ID_ISCRIZIONE_EVENTO`, `N_LAP`, `GAP_TO_LEADER`, `GAP_TO_POSITION`, `BEST_LAP`, `TOTAL_TIME`, `PUNTI`) VALUES(311, 3, '11', 57, NULL, NULL, NULL, NULL, NULL, 0.00);
+
+--
+-- Trigger `t_risultato`
+--
+DROP TRIGGER IF EXISTS `trigger_aftins`;
+DELIMITER $$
+CREATE TRIGGER `trigger_aftins` AFTER INSERT ON `t_risultato` FOR EACH ROW BEGIN
+	-- Solo se vengono inseriti/modificati i punti attribuiti, viene richamata la sp per aggiornare i punti in classifica
+	-- IF (NEW.PUNTI IS NOT NULL) THEN
+		-- CALL aggiorna_classifica_generale(NEW.ID_PILOTA, NEW.ID_TEAM, NEW.ID_SESSIONE);
+        CALL aggiorna_classifica_generale(NEW.ID_ISCRIZIONE_EVENTO, NEW.ID_SESSIONE);
+    -- END IF;
+END
+$$
+DELIMITER ;
+DROP TRIGGER IF EXISTS `trigger_aftupd`;
+DELIMITER $$
+CREATE TRIGGER `trigger_aftupd` AFTER UPDATE ON `t_risultato` FOR EACH ROW BEGIN
+	-- Solo se vengono inseriti/modificati i punti attribuiti, viene richamata la sp per aggiornare i punti in classifica
+	-- IF NOT (OLD.PUNTI <=> NEW.PUNTI) THEN
+		-- CALL aggiorna_classifica_generale(NEW.ID_PILOTA, NEW.ID_TEAM, NEW.ID_SESSIONE);
+        CALL aggiorna_classifica_generale(NEW.ID_ISCRIZIONE_EVENTO, NEW.ID_SESSIONE);
+    -- END IF;
+END
+$$
+DELIMITER ;
+DROP TRIGGER IF EXISTS `trigger_befins`;
+DELIMITER $$
+CREATE TRIGGER `trigger_befins` BEFORE INSERT ON `t_risultato` FOR EACH ROW BEGIN
+	-- A meno che non vengano settati manualmente i punti, viene richamata la sp per il calcolo
+	IF (NEW.PUNTI IS NULL) THEN
+   		CALL assegna_punti_risultato(NEW.PUNTI, NEW.POSIZIONE, NEW.ID_SESSIONE);
+    END IF;
+END
+$$
+DELIMITER ;
+DROP TRIGGER IF EXISTS `trigger_befupd`;
+DELIMITER $$
+CREATE TRIGGER `trigger_befupd` BEFORE UPDATE ON `t_risultato` FOR EACH ROW BEGIN
+	-- A meno che non vengano settati manualmente i punti, viene richamata la sp per il calcolo
+	 IF (OLD.PUNTI <=> NEW.PUNTI) THEN
+   		CALL assegna_punti_risultato(NEW.PUNTI, NEW.POSIZIONE, NEW.ID_SESSIONE);
+    END IF;
+END
+$$
+DELIMITER ;
+
+-- --------------------------------------------------------
+
+--
+-- Struttura della tabella `t_sessione`
+--
+
+DROP TABLE IF EXISTS `t_sessione`;
+CREATE TABLE `t_sessione` (
+  `ID_SESSIONE` int(11) NOT NULL,
+  `NOME` varchar(45) DEFAULT NULL,
+  `ID_EVENTO` int(11) DEFAULT NULL,
+  `ID_TIPO_SESSIONE` varchar(10) DEFAULT NULL,
+  `DURATA` decimal(6,2) DEFAULT NULL,
+  `UNITA_DURATA` enum('MIN','ORA','LAP') DEFAULT NULL,
+  `PERCENT_DURATA` decimal(5,2) DEFAULT NULL,
+  `NOTE` varchar(300) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+--
+-- Dump dei dati per la tabella `t_sessione`
+--
+
+INSERT INTO `t_sessione` (`ID_SESSIONE`, `NOME`, `ID_EVENTO`, `ID_TIPO_SESSIONE`, `DURATA`, `UNITA_DURATA`, `PERCENT_DURATA`, `NOTE`) VALUES(1, 'Qualifica rapida', 1, 'Q1', 5.00, 'MIN', NULL, NULL);
+INSERT INTO `t_sessione` (`ID_SESSIONE`, `NOME`, `ID_EVENTO`, `ID_TIPO_SESSIONE`, `DURATA`, `UNITA_DURATA`, `PERCENT_DURATA`, `NOTE`) VALUES(2, 'Gara Endurance', 1, 'GR1', 30.00, 'MIN', 100.00, 'BONUS.\r\nCOTUMACCIO(#8) +1 POSIZIONE: SORPASSO CONVALIDATO NEL GIRO ANNULLATO;\r\nPENALITA.\r\nCERBONE(#6) -1 GIRO: TAMPONAMENTO IN BOX;\r\nSETARO(#10) -1 GIRO: TAMPONAMENTO IN PISTA;');
+INSERT INTO `t_sessione` (`ID_SESSIONE`, `NOME`, `ID_EVENTO`, `ID_TIPO_SESSIONE`, `DURATA`, `UNITA_DURATA`, `PERCENT_DURATA`, `NOTE`) VALUES(3, 'Quali', 2, 'Q1', 5.00, 'MIN', 100.00, 'OK');
+INSERT INTO `t_sessione` (`ID_SESSIONE`, `NOME`, `ID_EVENTO`, `ID_TIPO_SESSIONE`, `DURATA`, `UNITA_DURATA`, `PERCENT_DURATA`, `NOTE`) VALUES(4, 'Gara Endurance', 2, 'GR1', 30.00, 'MIN', 100.00, NULL);
+INSERT INTO `t_sessione` (`ID_SESSIONE`, `NOME`, `ID_EVENTO`, `ID_TIPO_SESSIONE`, `DURATA`, `UNITA_DURATA`, `PERCENT_DURATA`, `NOTE`) VALUES(5, 'Quali', 3, 'Q1', 5.00, 'MIN', 100.00, 'OK');
+INSERT INTO `t_sessione` (`ID_SESSIONE`, `NOME`, `ID_EVENTO`, `ID_TIPO_SESSIONE`, `DURATA`, `UNITA_DURATA`, `PERCENT_DURATA`, `NOTE`) VALUES(6, 'Race', 3, 'GR1', 30.00, 'MIN', 100.00, 'OK');
+
+-- --------------------------------------------------------
+
+--
+-- Struttura della tabella `t_team`
+--
+
+DROP TABLE IF EXISTS `t_team`;
+CREATE TABLE `t_team` (
+  `ID_TEAM` int(11) NOT NULL,
+  `NOME` varchar(45) DEFAULT NULL,
+  `COLORE` varchar(45) DEFAULT NULL,
+  `DATA_MODIFICA` timestamp NULL DEFAULT NULL,
+  `ID_UTENTE` int(11) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+--
+-- Dump dei dati per la tabella `t_team`
+--
+
+INSERT INTO `t_team` (`ID_TEAM`, `NOME`, `COLORE`, `DATA_MODIFICA`, `ID_UTENTE`) VALUES(1, 'Acme Racing', 'Blu/Arancione', '2024-04-16 01:16:28', 1);
+INSERT INTO `t_team` (`ID_TEAM`, `NOME`, `COLORE`, `DATA_MODIFICA`, `ID_UTENTE`) VALUES(3, 'Man in black', NULL, NULL, NULL);
+INSERT INTO `t_team` (`ID_TEAM`, `NOME`, `COLORE`, `DATA_MODIFICA`, `ID_UTENTE`) VALUES(4, 'Green Bull', NULL, NULL, NULL);
+INSERT INTO `t_team` (`ID_TEAM`, `NOME`, `COLORE`, `DATA_MODIFICA`, `ID_UTENTE`) VALUES(5, 'Tkr', NULL, NULL, NULL);
+INSERT INTO `t_team` (`ID_TEAM`, `NOME`, `COLORE`, `DATA_MODIFICA`, `ID_UTENTE`) VALUES(6, 'Slowmotion', NULL, NULL, NULL);
+INSERT INTO `t_team` (`ID_TEAM`, `NOME`, `COLORE`, `DATA_MODIFICA`, `ID_UTENTE`) VALUES(7, 'Fast Life Team', NULL, NULL, NULL);
+INSERT INTO `t_team` (`ID_TEAM`, `NOME`, `COLORE`, `DATA_MODIFICA`, `ID_UTENTE`) VALUES(8, 'Sponzilli Team', NULL, NULL, NULL);
+INSERT INTO `t_team` (`ID_TEAM`, `NOME`, `COLORE`, `DATA_MODIFICA`, `ID_UTENTE`) VALUES(9, 'Speed Team', NULL, NULL, NULL);
+INSERT INTO `t_team` (`ID_TEAM`, `NOME`, `COLORE`, `DATA_MODIFICA`, `ID_UTENTE`) VALUES(10, 'Go Kart Boys', NULL, NULL, NULL);
+INSERT INTO `t_team` (`ID_TEAM`, `NOME`, `COLORE`, `DATA_MODIFICA`, `ID_UTENTE`) VALUES(11, 'Smooth Operators', NULL, NULL, NULL);
+INSERT INTO `t_team` (`ID_TEAM`, `NOME`, `COLORE`, `DATA_MODIFICA`, `ID_UTENTE`) VALUES(12, 'Jok A Kart', NULL, NULL, NULL);
+INSERT INTO `t_team` (`ID_TEAM`, `NOME`, `COLORE`, `DATA_MODIFICA`, `ID_UTENTE`) VALUES(13, 'RC-JP Team', NULL, NULL, NULL);
+INSERT INTO `t_team` (`ID_TEAM`, `NOME`, `COLORE`, `DATA_MODIFICA`, `ID_UTENTE`) VALUES(14, 'Alborelli Team', NULL, NULL, NULL);
+INSERT INTO `t_team` (`ID_TEAM`, `NOME`, `COLORE`, `DATA_MODIFICA`, `ID_UTENTE`) VALUES(15, 'Asterhot', NULL, NULL, NULL);
+
+-- --------------------------------------------------------
+
+--
+-- Struttura della tabella `t_tipo_sessione`
+--
+
+DROP TABLE IF EXISTS `t_tipo_sessione`;
+CREATE TABLE `t_tipo_sessione` (
+  `ID_TIPO_SESSIONE` varchar(10) NOT NULL,
+  `DESCRIZIONE` varchar(50) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+--
+-- Dump dei dati per la tabella `t_tipo_sessione`
+--
+
+INSERT INTO `t_tipo_sessione` (`ID_TIPO_SESSIONE`, `DESCRIZIONE`) VALUES('FP1', 'Prove libere 1');
+INSERT INTO `t_tipo_sessione` (`ID_TIPO_SESSIONE`, `DESCRIZIONE`) VALUES('FP2', 'Prove libere 2');
+INSERT INTO `t_tipo_sessione` (`ID_TIPO_SESSIONE`, `DESCRIZIONE`) VALUES('FP3', 'Prove libere 3');
+INSERT INTO `t_tipo_sessione` (`ID_TIPO_SESSIONE`, `DESCRIZIONE`) VALUES('GR1', 'Gara 1');
+INSERT INTO `t_tipo_sessione` (`ID_TIPO_SESSIONE`, `DESCRIZIONE`) VALUES('Q1', 'Qualifica 1');
+INSERT INTO `t_tipo_sessione` (`ID_TIPO_SESSIONE`, `DESCRIZIONE`) VALUES('RANKING', 'Classifica generale');
+INSERT INTO `t_tipo_sessione` (`ID_TIPO_SESSIONE`, `DESCRIZIONE`) VALUES('S-GR1', 'Gara Sprint');
+
+-- --------------------------------------------------------
+
+--
+-- Struttura della tabella `t_utente`
+--
+
+DROP TABLE IF EXISTS `t_utente`;
+CREATE TABLE `t_utente` (
+  `ID_UTENTE` int(11) NOT NULL,
+  `TELEGRAM_ID` varchar(45) DEFAULT NULL,
+  `USER_TELEGRAM` varchar(45) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+--
+-- Dump dei dati per la tabella `t_utente`
+--
+
+INSERT INTO `t_utente` (`ID_UTENTE`, `TELEGRAM_ID`, `USER_TELEGRAM`) VALUES(1, '293772578', '@roccofusco');
+INSERT INTO `t_utente` (`ID_UTENTE`, `TELEGRAM_ID`, `USER_TELEGRAM`) VALUES(2, '111', '@biagio.barra');
+INSERT INTO `t_utente` (`ID_UTENTE`, `TELEGRAM_ID`, `USER_TELEGRAM`) VALUES(3, '222', '@marco.coppola');
+
+-- --------------------------------------------------------
+
+--
+-- Struttura stand-in per le viste `v_classifica_team`
+-- (Vedi sotto per la vista effettiva)
+--
+DROP VIEW IF EXISTS `v_classifica_team`;
+CREATE TABLE `v_classifica_team` (
+`ID_CLASSIFICA_TEAM` int(11)
+,`ID_CAMPIONATO` int(11)
+,`POSIZIONE` bigint(21)
+,`ID_TEAM` int(11)
+,`PUNTI` decimal(28,2)
+,`num_primo_posto` bigint(21)
+,`num_secondo_posto` bigint(21)
+,`num_terzo_posto` bigint(21)
+,`media_posizioni` double
+);
+
+-- --------------------------------------------------------
+
+--
+-- Struttura per vista `v_classifica_team`
+--
+DROP TABLE IF EXISTS `v_classifica_team`;
+
+DROP VIEW IF EXISTS `v_classifica_team`;
+CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `v_classifica_team`  AS SELECT `tc`.`ID_CLASSIFICA` AS `ID_CLASSIFICA_TEAM`, `tc`.`ID_CAMPIONATO` AS `ID_CAMPIONATO`, CASE WHEN `reg`.`VALORE` = 'PTI-1P-2P-3P-AVG.P' THEN rank() over ( order by sum(`tc`.`PUNTI`) desc,`ris`.`num_primo_posto` desc,`ris`.`num_secondo_posto` desc,`ris`.`num_terzo_posto` desc,`ris`.`media_posizioni`) ELSE rank() over ( order by sum(`tc`.`PUNTI`) desc) END AS `POSIZIONE`, `tc`.`ID_TEAM` AS `ID_TEAM`, sum(`tc`.`PUNTI`) AS `PUNTI`, `ris`.`num_primo_posto` AS `num_primo_posto`, `ris`.`num_secondo_posto` AS `num_secondo_posto`, `ris`.`num_terzo_posto` AS `num_terzo_posto`, `ris`.`media_posizioni` AS `media_posizioni` FROM ((`t_classifica` `tc` left join (select `tie`.`ID_PILOTA` AS `ID_PILOTA`,`tie`.`ID_TEAM` AS `ID_TEAM`,`te`.`ID_CAMPIONATO` AS `ID_CAMPIONATO`,count(case when `tr`.`POSIZIONE` not in ('DNS','DNF','DSQ') and `tr`.`POSIZIONE` = 1 then 1 end) AS `num_primo_posto`,count(case when `tr`.`POSIZIONE` not in ('DNS','DNF','DSQ') and `tr`.`POSIZIONE` = 2 then 1 end) AS `num_secondo_posto`,count(case when `tr`.`POSIZIONE` not in ('DNS','DNF','DSQ') and `tr`.`POSIZIONE` = 3 then 1 end) AS `num_terzo_posto`,avg(case when `tr`.`POSIZIONE` not in ('DNS','DNF','DSQ') then `tr`.`POSIZIONE` end) AS `media_posizioni` from (((`t_risultato` `tr` join `t_sessione` `ts` on(`tr`.`ID_SESSIONE` = `ts`.`ID_SESSIONE` and `ts`.`ID_TIPO_SESSIONE` = 'GR1')) join `t_evento` `te` on(`ts`.`ID_EVENTO` = `te`.`ID_EVENTO`)) join `t_iscrizione_evento` `tie` on(`tie`.`ID_ISCRIZIONE_EVENTO` = `tr`.`ID_ISCRIZIONE_EVENTO`)) group by `te`.`ID_CAMPIONATO`,`tie`.`ID_TEAM`) `ris` on(`tc`.`ID_TEAM` = `ris`.`ID_TEAM` and `tc`.`ID_CAMPIONATO` = `ris`.`ID_CAMPIONATO`)) left join (select `c`.`ID_CAMPIONATO` AS `ID_CAMPIONATO`,`r`.`VALORE` AS `VALORE` from ((`t_regola` `r` join `t_regolamento` `reg`) join `t_campionato` `c`) where `r`.`ID_REGOLA` = `reg`.`ID_REGOLA` and `reg`.`ID_REGOLAMENTO` = `c`.`ID_REGOLAMENTO` and `r`.`GRUPPO_REGOLA` = 'CRITERIO-ORDINE-CLASSIFICA' and `r`.`ID_TIPO_SESSIONE` = 'RANKING' and `r`.`DOMINIO` = 'RANK' and `r`.`CHIAVE` = 'RANK') `reg` on(`tc`.`ID_CAMPIONATO` = `reg`.`ID_CAMPIONATO`)) GROUP BY `tc`.`ID_CAMPIONATO`, `tc`.`ID_TEAM` ORDER BY `tc`.`ID_CAMPIONATO` DESC, CASE WHEN `reg`.`VALORE` = 'PTI-1P-2P-3P-AVG.P' THEN rank() over ( order by sum(`tc`.`PUNTI`) desc,`ris`.`num_primo_posto` desc,`ris`.`num_secondo_posto` desc,`ris`.`num_terzo_posto` desc,`ris`.`media_posizioni`) ELSE rank() over ( order by sum(`tc`.`PUNTI`) desc) END ASC ;
+
+--
+-- Indici per le tabelle scaricate
+--
+
+--
+-- Indici per le tabelle `t_campionato`
+--
+ALTER TABLE `t_campionato`
+  ADD PRIMARY KEY (`ID_CAMPIONATO`),
+  ADD UNIQUE KEY `UNIQUE_NOME` (`NOME`) USING BTREE,
+  ADD KEY `ID_UTENTE` (`ID_UTENTE`),
+  ADD KEY `ID_REGOLAMENTO` (`ID_REGOLAMENTO`) USING BTREE;
+
+--
+-- Indici per le tabelle `t_classifica`
+--
+ALTER TABLE `t_classifica`
+  ADD PRIMARY KEY (`ID_CLASSIFICA`),
+  ADD UNIQUE KEY `UNIQUE_PILOTA-CAMPIONATO` (`ID_CAMPIONATO`,`ID_PILOTA`),
+  ADD KEY `ID_PILOTA` (`ID_PILOTA`),
+  ADD KEY `ID_TEAM` (`ID_TEAM`);
+
+--
+-- Indici per le tabelle `t_evento`
+--
+ALTER TABLE `t_evento`
+  ADD PRIMARY KEY (`ID_EVENTO`),
+  ADD KEY `ID_PISTA` (`ID_PISTA`),
+  ADD KEY `ID_CAMPIONATO` (`ID_CAMPIONATO`);
+
+--
+-- Indici per le tabelle `t_iscrizione_evento`
+--
+ALTER TABLE `t_iscrizione_evento`
+  ADD PRIMARY KEY (`ID_ISCRIZIONE_EVENTO`),
+  ADD UNIQUE KEY `UNIQUE_PILOTA-EVENTO` (`ID_PILOTA`,`ID_EVENTO`),
+  ADD UNIQUE KEY `UNIQUE_TARGA-EVENTO` (`ID_EVENTO`,`TARGA_VEICOLO`),
+  ADD KEY `ID_TEAM` (`ID_TEAM`),
+  ADD KEY `ID_PILOTA` (`ID_PILOTA`),
+  ADD KEY `ID_EVENTO` (`ID_EVENTO`);
+
+--
+-- Indici per le tabelle `t_pilota`
+--
+ALTER TABLE `t_pilota`
+  ADD PRIMARY KEY (`ID_PILOTA`),
+  ADD KEY `ID_UTENTE` (`ID_UTENTE`) USING BTREE,
+  ADD KEY `ID_TEAM` (`ID_TEAM`) USING BTREE;
+
+--
+-- Indici per le tabelle `t_pista`
+--
+ALTER TABLE `t_pista`
+  ADD PRIMARY KEY (`ID_PISTA`);
+
+--
+-- Indici per le tabelle `t_regola`
+--
+ALTER TABLE `t_regola`
+  ADD PRIMARY KEY (`ID_REGOLA`),
+  ADD KEY `ID_TIPO_SESSIONE` (`ID_TIPO_SESSIONE`);
+
+--
+-- Indici per le tabelle `t_regolamento`
+--
+ALTER TABLE `t_regolamento`
+  ADD PRIMARY KEY (`ID_REGOLAMENTO`,`ID_REGOLA`),
+  ADD KEY `ID_REGOLAMENTO` (`ID_REGOLAMENTO`),
+  ADD KEY `ID_REGOLA` (`ID_REGOLA`) USING BTREE;
+
+--
+-- Indici per le tabelle `t_risultato`
+--
+ALTER TABLE `t_risultato`
+  ADD PRIMARY KEY (`ID_RISULTATO`),
+  ADD UNIQUE KEY `UNIQUE_POSIZIONE-SESSIONE` (`ID_SESSIONE`,`POSIZIONE`),
+  ADD UNIQUE KEY `UNIQUE_SESSIONE-ID_ISCRIZIONE_EVENTO` (`ID_SESSIONE`,`ID_ISCRIZIONE_EVENTO`),
+  ADD KEY `ID_SESSIONE` (`ID_SESSIONE`),
+  ADD KEY `ID_ISCRIZIONE_EVENTO` (`ID_ISCRIZIONE_EVENTO`) USING BTREE;
+
+--
+-- Indici per le tabelle `t_sessione`
+--
+ALTER TABLE `t_sessione`
+  ADD PRIMARY KEY (`ID_SESSIONE`),
+  ADD KEY `ID_TIPO_SESSIONE` (`ID_TIPO_SESSIONE`),
+  ADD KEY `ID_EVENTO` (`ID_EVENTO`);
+
+--
+-- Indici per le tabelle `t_team`
+--
+ALTER TABLE `t_team`
+  ADD PRIMARY KEY (`ID_TEAM`),
+  ADD UNIQUE KEY `UNIQUE_NOME` (`NOME`) USING BTREE,
+  ADD KEY `ID_UTENTE` (`ID_UTENTE`);
+
+--
+-- Indici per le tabelle `t_tipo_sessione`
+--
+ALTER TABLE `t_tipo_sessione`
+  ADD PRIMARY KEY (`ID_TIPO_SESSIONE`);
+
+--
+-- Indici per le tabelle `t_utente`
+--
+ALTER TABLE `t_utente`
+  ADD PRIMARY KEY (`ID_UTENTE`),
+  ADD UNIQUE KEY `UNIQUE_USER_TELEGRAM` (`USER_TELEGRAM`) USING BTREE,
+  ADD UNIQUE KEY `UNIQUE_TELEGRAM_ID` (`TELEGRAM_ID`);
+
+--
+-- AUTO_INCREMENT per le tabelle scaricate
+--
+
+--
+-- AUTO_INCREMENT per la tabella `t_campionato`
+--
+ALTER TABLE `t_campionato`
+  MODIFY `ID_CAMPIONATO` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=6;
+
+--
+-- AUTO_INCREMENT per la tabella `t_classifica`
+--
+ALTER TABLE `t_classifica`
+  MODIFY `ID_CLASSIFICA` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=64;
+
+--
+-- AUTO_INCREMENT per la tabella `t_evento`
+--
+ALTER TABLE `t_evento`
+  MODIFY `ID_EVENTO` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=4;
+
+--
+-- AUTO_INCREMENT per la tabella `t_iscrizione_evento`
+--
+ALTER TABLE `t_iscrizione_evento`
+  MODIFY `ID_ISCRIZIONE_EVENTO` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=68;
+
+--
+-- AUTO_INCREMENT per la tabella `t_pilota`
+--
+ALTER TABLE `t_pilota`
+  MODIFY `ID_PILOTA` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=31;
+
+--
+-- AUTO_INCREMENT per la tabella `t_pista`
+--
+ALTER TABLE `t_pista`
+  MODIFY `ID_PISTA` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=5;
+
+--
+-- AUTO_INCREMENT per la tabella `t_regola`
+--
+ALTER TABLE `t_regola`
+  MODIFY `ID_REGOLA` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=28;
+
+--
+-- AUTO_INCREMENT per la tabella `t_risultato`
+--
+ALTER TABLE `t_risultato`
+  MODIFY `ID_RISULTATO` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=312;
+
+--
+-- AUTO_INCREMENT per la tabella `t_sessione`
+--
+ALTER TABLE `t_sessione`
+  MODIFY `ID_SESSIONE` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=7;
+
+--
+-- AUTO_INCREMENT per la tabella `t_team`
+--
+ALTER TABLE `t_team`
+  MODIFY `ID_TEAM` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=16;
+
+--
+-- AUTO_INCREMENT per la tabella `t_utente`
+--
+ALTER TABLE `t_utente`
+  MODIFY `ID_UTENTE` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=7;
+
+--
+-- Limiti per le tabelle scaricate
+--
+
+--
+-- Limiti per la tabella `t_campionato`
+--
+ALTER TABLE `t_campionato`
+  ADD CONSTRAINT `t_campionato_ibfk_1` FOREIGN KEY (`ID_REGOLAMENTO`) REFERENCES `t_regolamento` (`ID_REGOLAMENTO`) ON DELETE CASCADE ON UPDATE CASCADE,
+  ADD CONSTRAINT `t_campionato_ibfk_2` FOREIGN KEY (`ID_UTENTE`) REFERENCES `t_utente` (`ID_UTENTE`) ON DELETE CASCADE ON UPDATE CASCADE;
+
+--
+-- Limiti per la tabella `t_classifica`
+--
+ALTER TABLE `t_classifica`
+  ADD CONSTRAINT `t_classifica_ibfk_1` FOREIGN KEY (`ID_CAMPIONATO`) REFERENCES `t_campionato` (`ID_CAMPIONATO`) ON DELETE CASCADE ON UPDATE CASCADE,
+  ADD CONSTRAINT `t_classifica_ibfk_2` FOREIGN KEY (`ID_PILOTA`) REFERENCES `t_pilota` (`ID_PILOTA`) ON DELETE CASCADE ON UPDATE CASCADE,
+  ADD CONSTRAINT `t_classifica_ibfk_3` FOREIGN KEY (`ID_TEAM`) REFERENCES `t_team` (`ID_TEAM`) ON DELETE CASCADE ON UPDATE CASCADE;
+
+--
+-- Limiti per la tabella `t_evento`
+--
+ALTER TABLE `t_evento`
+  ADD CONSTRAINT `t_evento_ibfk_1` FOREIGN KEY (`ID_PISTA`) REFERENCES `t_pista` (`ID_PISTA`) ON DELETE CASCADE ON UPDATE CASCADE,
+  ADD CONSTRAINT `t_evento_ibfk_2` FOREIGN KEY (`ID_CAMPIONATO`) REFERENCES `t_campionato` (`ID_CAMPIONATO`) ON DELETE CASCADE ON UPDATE CASCADE;
+
+--
+-- Limiti per la tabella `t_iscrizione_evento`
+--
+ALTER TABLE `t_iscrizione_evento`
+  ADD CONSTRAINT `t_iscrizione_evento_ibfk_1` FOREIGN KEY (`ID_PILOTA`) REFERENCES `t_pilota` (`ID_PILOTA`) ON DELETE CASCADE ON UPDATE CASCADE,
+  ADD CONSTRAINT `t_iscrizione_evento_ibfk_2` FOREIGN KEY (`ID_TEAM`) REFERENCES `t_team` (`ID_TEAM`) ON DELETE CASCADE ON UPDATE CASCADE,
+  ADD CONSTRAINT `t_iscrizione_evento_ibfk_3` FOREIGN KEY (`ID_EVENTO`) REFERENCES `t_evento` (`ID_EVENTO`) ON DELETE CASCADE ON UPDATE CASCADE;
+
+--
+-- Limiti per la tabella `t_pilota`
+--
+ALTER TABLE `t_pilota`
+  ADD CONSTRAINT `t_pilota_ibfk_1` FOREIGN KEY (`ID_UTENTE`) REFERENCES `t_utente` (`ID_UTENTE`) ON DELETE CASCADE ON UPDATE CASCADE,
+  ADD CONSTRAINT `t_pilota_ibfk_2` FOREIGN KEY (`ID_TEAM`) REFERENCES `t_team` (`ID_TEAM`) ON DELETE CASCADE ON UPDATE CASCADE;
+
+--
+-- Limiti per la tabella `t_regola`
+--
+ALTER TABLE `t_regola`
+  ADD CONSTRAINT `t_regola_ibfk_1` FOREIGN KEY (`ID_TIPO_SESSIONE`) REFERENCES `t_tipo_sessione` (`ID_TIPO_SESSIONE`) ON DELETE CASCADE ON UPDATE CASCADE;
+
+--
+-- Limiti per la tabella `t_regolamento`
+--
+ALTER TABLE `t_regolamento`
+  ADD CONSTRAINT `t_regolamento_ibfk_1` FOREIGN KEY (`ID_REGOLA`) REFERENCES `t_regola` (`ID_REGOLA`) ON DELETE CASCADE ON UPDATE CASCADE;
+
+--
+-- Limiti per la tabella `t_risultato`
+--
+ALTER TABLE `t_risultato`
+  ADD CONSTRAINT `t_risultato_ibfk_1` FOREIGN KEY (`ID_SESSIONE`) REFERENCES `t_sessione` (`ID_SESSIONE`) ON DELETE CASCADE ON UPDATE CASCADE,
+  ADD CONSTRAINT `t_risultato_ibfk_2` FOREIGN KEY (`ID_ISCRIZIONE_EVENTO`) REFERENCES `t_iscrizione_evento` (`ID_ISCRIZIONE_EVENTO`) ON DELETE CASCADE ON UPDATE CASCADE;
+
+--
+-- Limiti per la tabella `t_sessione`
+--
+ALTER TABLE `t_sessione`
+  ADD CONSTRAINT `t_sessione_ibfk_1` FOREIGN KEY (`ID_TIPO_SESSIONE`) REFERENCES `t_tipo_sessione` (`ID_TIPO_SESSIONE`) ON DELETE CASCADE ON UPDATE CASCADE,
+  ADD CONSTRAINT `t_sessione_ibfk_2` FOREIGN KEY (`ID_EVENTO`) REFERENCES `t_evento` (`ID_EVENTO`) ON DELETE CASCADE ON UPDATE CASCADE;
+
+--
+-- Limiti per la tabella `t_team`
+--
+ALTER TABLE `t_team`
+  ADD CONSTRAINT `t_team_ibfk_1` FOREIGN KEY (`ID_UTENTE`) REFERENCES `t_utente` (`ID_UTENTE`) ON DELETE CASCADE ON UPDATE CASCADE;
+COMMIT;
+
+/*!40101 SET CHARACTER_SET_CLIENT=@OLD_CHARACTER_SET_CLIENT */;
+/*!40101 SET CHARACTER_SET_RESULTS=@OLD_CHARACTER_SET_RESULTS */;
+/*!40101 SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION */;
